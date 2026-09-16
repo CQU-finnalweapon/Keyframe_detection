@@ -13,6 +13,32 @@ Cross-Embodiment Policy Transfer*，已被 **IROS 2026** 接收。
 > 审阅工具（诊断图表 + 叠加审阅视频）以及一套合成信号测试。原始 LICENSE 与
 > 引用信息保持原样；新增内容见下方[两条工作流](#两条工作流)。
 
+## 🎬 效果预览
+
+审阅视频把相机画面与实时关键帧看板叠在一起（**点击图片播放**，示例为
+`PickPlaceONLY_Moz1_cjb` 第 0 集）：
+
+[![关键帧审阅视频：画面 + 实时关键帧看板](assets/keypose_review_demo_poster.png)](assets/keypose_review_demo.mp4)
+
+上图这一帧正落在 `grasp` 关键帧上，可以看到：横幅变成实色的 `KEYPOSE: GRASP (right arm)`，
+画面被描边，左下夹爪放大图里红色曲线（右臂）**恰好从白色播放头处开始下降**，
+右侧看板的 `ON KEYFRAME: GRASP (right)` 与关键帧列表同步高亮。
+
+画面分五块：
+
+| 区域 | 内容 |
+|---|---|
+| 顶部横幅 | `KEYPOSE: GRASP (right arm)` + 帧号与子任务号；接近关键帧时显示帧距，命中时整条变实色并把画面描边 |
+| 左侧画面 | 数据集相机（此处 `cam_high`），按原生分辨率渲染不放大；`--cameras` 可多机位并排 |
+| 左下夹爪放大图 | 当前帧 ±3 s 的**逐帧**夹爪曲线，叠加检测到的区间底色与关键帧竖线 —— 用来直接判断"关键帧是否真的落在夹爪动作上" |
+| 右侧看板 | 集号/帧号/时间、当前子任务（pick/place、手臂、窗口、英文文本）、关键帧状态、双臂夹爪开合条、全部关键帧与子任务列表 |
+| 底部时间线 | 子任务色带、逐臂夹爪区间、关键帧刻度、白色播放头、图例 |
+
+生成方法见[快速上手](#快速上手)与[审阅 LeRobot 结果](#审阅-lerobot-结果)。
+
+> 仓库内只保留这一段演示视频（约 7 MB，为控制体积按 CRF 26 重新编码）。
+> 批量输出默认落在 `.gitignore` 的 `data/` 下，不入库。
+
 ## 两条工作流
 
 两者都采用同一套"**语义 / 时序**"解耦思路，区别只在于语义阶段（"发生了什么、大致在何时"）
@@ -113,6 +139,9 @@ keypose_labelling/
 ├── merge_trajectory_vl.py          # 单集调试 / 校验
 ├── hdf5_to_video.py                # 从 HDF5 数据集渲染演示视频
 ├── LEROBOT_PIPELINE.md             # LeRobot 模式：数据约定、匹配规则、实测指标
+├── assets/                         # 仓库内置的媒体资产（仅演示用）
+│   ├── keypose_review_demo.mp4             # 审阅视频演示（第 0 集）
+│   └── keypose_review_demo_poster.png      # 演示视频的海报帧
 ├── src/                            # 核心标注模块
 │   ├── trajectory_segmentation_v3.py  # 逐轴运动 + 夹爪分段（唯一事实来源）
 │   ├── event_corrector_v3.py       # 语义-运动事件校正
@@ -158,52 +187,28 @@ keypose_labelling/
 
 ## 📋 流程总览
 
-```
-                    用哪个数据集？
-        ┌───────────────────┴────────────────────┐
-        │                                        │
-  robomimic HDF5                     LeRobot parquet + 子任务标注
-        │                                        │
-  ┌─────┴──────────────┐              gen_dataset_lerobot.py
-  │ VL 模式   │ --auto │              （标注驱动，无 VLM，无 API key）
-  └─────┬──────┴───┬───┘                         │
-        │          │                             │
-  [1] 视频 → VL    │ （跳过）                     │
-  [2] 事件校正     │ （跳过）                     │
-  [3] gen_dataset.py ───────────────────────────┘
-        │                                        │
-        └───────────────┬────────────────────────┘
-                        ▼
-            关键帧训练数据集（kp_episode_*.hdf5）
-                        ▼
-          [可选] 诊断图表 + 叠加审阅视频
+```mermaid
+flowchart TD
+    Q{"用哪个数据集？"}
+    Q -->|"robomimic HDF5"| RM["robomimic 分支"]
+    Q -->|"LeRobot parquet + 子任务标注"| LR["gen_dataset_lerobot.py<br/>标注驱动，无 VLM，无 API key"]
+    RM --> VL["VL 模式（默认）<br/>[1] 视频 → VL 分析<br/>[2] 事件校正"]
+    RM --> AUTO["auto 模式（--auto）<br/>跳过 VL 步骤"]
+    VL --> GEN["[3] gen_dataset.py"]
+    AUTO --> GEN
+    LR --> GEN
+    GEN --> OUT["关键帧训练数据集<br/>kp_episode_*.hdf5"]
+    OUT --> REV["[可选] 诊断图表 + 叠加审阅视频"]
 ```
 
-robomimic 分支展开：
+robomimic 分支的两种模式对比：
 
-```
-原始 HDF5 数据集（robomimic, low_dim_abs.hdf5）
-         │
-    ┌────┴───────────────────────────────────────────┐
-    │ VL 模式（默认）                                 │ auto 模式（--auto）
-    │                                                │
-    │ run_full_pipeline.sh <task> <N>                │ run_full_pipeline.sh --auto <task> [N]
-    │                                                │
-    │ [1] 01_prepare_videos.sh                       │ （跳过 —— 不需要 VL）
-    │      → HDF5 → 视频 → VL 分析                   │
-    │      → data/divided_events/                    │
-    │ [2] 02_correct_events.sh                       │ （跳过 —— 不需要 VL）
-    │      → 把 VL 事件匹配到轨迹                     │
-    │      → data/corrected_events/                  │
-    │ [3] 03_generate_dataset.sh                     │ [3] 03_generate_dataset.sh --auto
-    │      → gen_dataset.py（用 VL 事件）            │     → gen_dataset.py --auto
-    │                                                │       （基于夹爪的伪事件）
-    └────┬───────────────────────────────────────────┘
-         │
-    关键帧训练数据集（kp_episode_*.hdf5）
-         │
-    [可选] 04/05 可视化脚本
-```
+| 步骤 | VL 模式（默认） | auto 模式（`--auto`） |
+|---|---|---|
+| 1 | `01_prepare_videos.sh`：HDF5 → 视频 → VL 分析 → `data/divided_events/` | 跳过（不需要 VL） |
+| 2 | `02_correct_events.sh`：把 VL 事件匹配到轨迹 → `data/corrected_events/` | 跳过（不需要 VL） |
+| 3 | `03_generate_dataset.sh` → `gen_dataset.py`（消费 VL 事件） | `03_generate_dataset.sh --auto` → `gen_dataset.py --auto`（基于夹爪的伪事件） |
+| 入口 | `run_full_pipeline.sh <task> <N>` | `run_full_pipeline.sh --auto <task> [N]` |
 
 **什么时候用哪个模式：**
 
@@ -407,6 +412,10 @@ python gen_dataset_lerobot.py --dataset_root ... --output_dir ... \
 ```
 
 ### 审阅 LeRobot 结果
+
+仓库内已有一段现成的演示视频：`assets/keypose_review_demo.mp4`
+（画面说明见顶部[效果预览](#-效果预览)）。
+
 ```bash
 # 每集一张图 + 一张总览长图
 python viz/visualize_lerobot_episode.py --dataset_root ... --num_episodes 20
