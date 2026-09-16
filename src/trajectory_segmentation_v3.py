@@ -678,7 +678,9 @@ def segment_gripper_timeline(
     gripper: np.ndarray,
     action_gripper: np.ndarray,
     gripper_threshold: float = 1e-4,
-    max_gap: int = 5
+    max_gap: int = 5,
+    sentinel_tail: bool = True,
+    mask_whole_command_run: bool = True
 ) -> List[Interval]:
     """
     Segment gripper actions into opening/closing intervals.
@@ -688,7 +690,16 @@ def segment_gripper_timeline(
         action_gripper: (N,) array of gripper commands (-1=open, 1=close, 0=none)
         gripper_threshold: Threshold for gripper change detection
         max_gap: Maximum gap to fill in gripper labels
-        
+        sentinel_tail: Append a 1-frame dummy interval at the end when the last
+            action is a close (or open). Robomimic needs it to guarantee a
+            trailing grasp/release; set False for datasets where the annotation
+            already defines the final event.
+        mask_whole_command_run: How to treat a measurement that contradicts the
+            issued command. True (robomimic default) masks the whole command run,
+            which is right for discrete commands. False masks only the frames that
+            actually conflict, which is required when the command is a continuous
+            setpoint that legitimately lags the measured state by a frame or two.
+
     Returns:
         List of Interval objects with 'opening' or 'closing' labels
     """
@@ -711,7 +722,9 @@ def segment_gripper_timeline(
             raw_labels.append("none")
     
     # Filter using action_gripper (exclude correction periods)
-    filtered_labels = _filter_gripper_labels(raw_labels, action_gripper)
+    filtered_labels = _filter_gripper_labels(
+        raw_labels, action_gripper, mask_whole_command_run=mask_whole_command_run
+    )
     
     # Fill small gaps
     filled_labels = _fill_gripper_gaps(filtered_labels, max_gap)
@@ -737,7 +750,7 @@ def segment_gripper_timeline(
     # If the last interval is closing, we might be missing a release at the very end.
     # If the last interval is opening, we might be missing a grasp.
     # We add a 1-frame interval at the very end to ensure the logic works.
-    if n > 0:
+    if sentinel_tail and n > 0:
         last_state = "none"
         if intervals:
             last_state = intervals[-1].label
@@ -759,32 +772,171 @@ def segment_gripper_timeline(
     return intervals
 
 
+def merge_gripper_hiccups(
+    intervals: List[Interval],
+    max_hiccup: int = 5
+) -> List[Interval]:
+    """Merge ``close -> brief open -> close`` hiccups into a single interval.
+
+    Real grippers often close in two stages (contact, then squeeze) with a
+    one-to-five frame blip of opposite sign in between.  Treating that blip as a
+    real direction change splits one grasp into two events, and the resulting
+    close-open pair then looks like a correction motion -- so it would be
+    dropped entirely.
+
+    The three intervals must form a *local* pattern: the opposing blip has to be
+    short **and** all three have to be contiguous (no long idle gap in between).
+    Without the contiguity requirement this function happily welds the closing
+    action of one subtask to the closing action of the next one, producing a
+    single interval that spans most of the episode.
+
+    Args:
+        intervals: chronological gripper intervals.
+        max_hiccup: longest opposing interval (frames) that may be absorbed, and
+            also the largest idle gap tolerated between the merged parts.
+
+    Returns:
+        Merged interval list.  A no-op when ``max_hiccup <= 0``.
+    """
+    if max_hiccup <= 0 or len(intervals) < 3:
+        return list(intervals)
+
+    ordered = sorted(intervals, key=lambda iv: iv.start)
+    merged: List[Interval] = []
+    k = 0
+    while k < len(ordered):
+        if k + 2 < len(ordered):
+            a, b, c = ordered[k], ordered[k + 1], ordered[k + 2]
+            gap_ab = b.start - a.end
+            gap_bc = c.start - b.end
+            if (
+                a.label == c.label
+                and a.label != b.label
+                and (b.end - b.start) <= max_hiccup
+                and 0 <= gap_ab <= max_hiccup
+                and 0 <= gap_bc <= max_hiccup
+            ):
+                merged.append(Interval(start=a.start, end=c.end, label=a.label))
+                k += 3
+                continue
+        merged.append(ordered[k])
+        k += 1
+    return merged
+
+
+def merge_interrupted_actions(
+    intervals: List[Interval],
+    gripper_signal: np.ndarray,
+    max_gap: int = 60,
+    reversal_tolerance: float = 1e-3
+) -> List[Interval]:
+    """Merge consecutive same-label intervals interrupted by a slow plateau.
+
+    A physical gripper action runs until the gripper *reverses*, not until it
+    merely slows down.  On real hardware a slow closure easily spends tens of
+    frames moving less than the per-frame detection threshold, so the naive diff
+    segmentation chops one grasp into several pieces -- which then look like
+    repeated grasps.
+
+    Two intervals are merged when they carry the same label and the gripper
+    signal across the idle gap keeps moving the same way (within
+    ``reversal_tolerance``).  Because the merge requires identical labels that are
+    *adjacent* in the timeline, a real reversal (which produces an opposite-label
+    interval) always blocks it, so distant actions can never be welded together.
+
+    Args:
+        intervals: chronological gripper intervals.
+        gripper_signal: (N,) or (N, 2) measured gripper opening.
+        max_gap: Largest idle gap (frames) to look across.
+        reversal_tolerance: Metres of opposing drift tolerated inside the gap.
+
+    Returns:
+        Merged interval list.
+    """
+    if len(intervals) < 2 or max_gap <= 0:
+        return list(intervals)
+
+    signal = np.asarray(gripper_signal, dtype=float)
+    if signal.ndim == 2:
+        signal = signal[:, 0] - signal[:, 1]
+    signal = signal.reshape(-1)
+
+    ordered = sorted(intervals, key=lambda iv: iv.start)
+    merged: List[Interval] = [ordered[0]]
+
+    for iv in ordered[1:]:
+        prev = merged[-1]
+        gap = iv.start - prev.end
+        if iv.label != prev.label or not (0 <= gap <= max_gap):
+            merged.append(iv)
+            continue
+
+        # Signal value entering the gap vs leaving it.
+        before = float(signal[min(max(prev.end - 1, 0), len(signal) - 1)])
+        after = float(signal[min(max(iv.start - 1, 0), len(signal) - 1)])
+        delta = after - before
+
+        if prev.label == "closing":  # a closure drives the opening downwards
+            continues = delta <= reversal_tolerance
+        else:  # an opening drives it upwards
+            continues = delta >= -reversal_tolerance
+
+        if continues:
+            merged[-1] = Interval(start=prev.start, end=iv.end, label=prev.label)
+        else:
+            merged.append(iv)
+
+    return merged
+
+
 def filter_gripper_intervals(
     gripper_intervals: List[Interval],
     movement_intervals: List[Interval],
     min_movement_between: int = 10,
     max_close_open_gap: int = 30,
-    min_closing_duration: int = 4  # Minimum frames for a valid closing interval
+    min_closing_duration: int = 4,  # Minimum frames for a valid closing interval
+    min_opening_duration: int = 1,  # Minimum frames for a valid opening interval
+    gripper_signal: Optional[np.ndarray] = None,
+    min_short_travel: float = 5e-3
 ) -> List[Interval]:
     """Filter gripper intervals (reused from V2).
     
     Filters out:
-    1. Short closing intervals (likely noise)
+    1. Short intervals (likely noise / sensor blips)
     2. Close-open pairs with minimal movement between (correction periods)
+
+    A short interval is only rejected when it also moves the gripper very little:
+    a release that snaps fully open in a single frame carries ~0.1 m of travel and
+    is a real event, while a one-frame jitter of a millimetre is not.  Supply
+    ``gripper_signal`` to enable that amplitude test.
     """
     if not gripper_intervals:
         return []
-    
+
+    signal: Optional[np.ndarray] = None
+    if gripper_signal is not None:
+        signal = np.asarray(gripper_signal, dtype=float)
+        if signal.ndim == 2:
+            signal = signal[:, 0] - signal[:, 1]
+        signal = signal.reshape(-1)
+
+    def _short_but_real(iv: Interval) -> bool:
+        """A short interval that nevertheless moves the gripper a long way."""
+        if signal is None or min_short_travel <= 0 or signal.size == 0:
+            return False
+        lo = max(0, min(iv.start - 1, signal.size - 1))
+        hi = max(0, min(iv.end - 1, signal.size - 1))
+        return abs(float(signal[hi]) - float(signal[lo])) >= min_short_travel
+
     sorted_intervals = sorted(gripper_intervals, key=lambda x: x.start)
     
-    # First pass: filter out short closing intervals (noise)
+    # First pass: filter out short intervals (noise)
     duration_filtered = []
     for iv in sorted_intervals:
-        if iv.label == 'closing':
-            duration = iv.end - iv.start
-            if duration < min_closing_duration:
-                # Skip short closing intervals (likely noise/false positive)
-                continue
+        duration = iv.end - iv.start
+        min_duration = min_closing_duration if iv.label == 'closing' else min_opening_duration
+        if duration < min_duration and not _short_but_real(iv):
+            continue
         duration_filtered.append(iv)
     
     filtered = []
@@ -826,8 +978,21 @@ def filter_gripper_intervals(
     return filtered
 
 
-def _filter_gripper_labels(raw_labels: List[str], action_gripper: np.ndarray) -> List[str]:
-    """Filter gripper labels to exclude correction periods."""
+def _filter_gripper_labels(
+    raw_labels: List[str],
+    action_gripper: np.ndarray,
+    mask_whole_command_run: bool = True
+) -> List[str]:
+    """Filter gripper labels to exclude periods where the measurement conflicts
+    with the issued gripper command.
+
+    ``mask_whole_command_run=True`` reproduces the historical robomimic behaviour:
+    the moment a conflict appears, the rest of that command run is masked.  That
+    is appropriate for discrete commands, but destroys valid motion whenever the
+    state lags a continuous setpoint by a frame or two -- hence the opt-out, which
+    masks only the frames that actually contradict the command and therefore keeps
+    a superset of the intervals.
+    """
     n = len(raw_labels)
     filtered = ["none"] * n
     
@@ -836,28 +1001,28 @@ def _filter_gripper_labels(raw_labels: List[str], action_gripper: np.ndarray) ->
         action = action_gripper[i]
         raw_label = raw_labels[i]
         
-        if action == -1:  # Opening command
-            if raw_label == "closing":
-                # Skip correction period
-                filtered[i] = "none"
-                i += 1
-                while i < n and action_gripper[i] == -1:
-                    filtered[i] = "none"
-                    i += 1
-                continue
-            else:
-                filtered[i] = raw_label
-        elif action == 1:  # Closing command
-            if raw_label == "opening":
-                # Skip correction period
-                filtered[i] = "none"
-                i += 1
-                while i < n and action_gripper[i] == 1:
-                    filtered[i] = "none"
-                    i += 1
-                continue
-            else:
-                filtered[i] = raw_label
+        if action == -1 and raw_label == "closing":
+            # Command opens but the gripper keeps closing: mask the conflict.
+            filtered[i] = "none"
+            j = i + 1
+            while j < n and action_gripper[j] == -1 and (
+                mask_whole_command_run or raw_labels[j] == "closing"
+            ):
+                filtered[j] = "none"
+                j += 1
+            i = j
+            continue
+        elif action == 1 and raw_label == "opening":
+            # Command closes but the gripper keeps opening: mask the conflict.
+            filtered[i] = "none"
+            j = i + 1
+            while j < n and action_gripper[j] == 1 and (
+                mask_whole_command_run or raw_labels[j] == "opening"
+            ):
+                filtered[j] = "none"
+                j += 1
+            i = j
+            continue
         else:
             filtered[i] = raw_label
         
@@ -910,7 +1075,16 @@ def segment_trajectory_v3(
     thresholds: dict = None,
     gripper_threshold: float = 1e-4,
     max_gap: int = 5,
-    sampling_interval: float = 0.04
+    sampling_interval: float = 0.04,
+    min_movement_between: int = 10,
+    max_close_open_gap: int = 30,
+    min_closing_duration: int = 4,
+    min_opening_duration: int = 1,
+    merge_hiccup_gaps: int = 0,
+    interrupted_action_gap: int = 0,
+    min_short_travel: float = 0.0,
+    mask_whole_command_run: bool = True,
+    sentinel_tail: bool = True
 ) -> Dict[str, List[Interval]]:
     """
     Segment trajectory using V3 logic.
@@ -924,6 +1098,29 @@ def segment_trajectory_v3(
         gripper_threshold: Gripper change threshold
         max_gap: Maximum gap to fill
         sampling_interval: Time between samples
+        min_movement_between: Minimum moving frames between a close/open pair for
+            the pair to count as a real grasp-release cycle (otherwise it is a
+            correction motion and gets dropped)
+        max_close_open_gap: Max frame gap between a close and the following open
+            for the pair to be considered a correction motion
+        min_closing_duration: Closing intervals shorter than this are dropped as noise
+        min_opening_duration: Opening intervals shorter than this are dropped as noise
+        merge_hiccup_gaps: Merge `close -> brief open -> close` blips up to this
+            many frames into a single closing interval (0 = disable)
+        interrupted_action_gap: Merge same-label intervals separated by an idle
+            plateau of up to this many frames, provided the gripper signal does
+            not reverse inside the gap (0 = disable).  Needed for real grippers,
+            whose slow closures dip below the per-frame threshold and would
+            otherwise be split into several fake actions.
+        min_short_travel: Metres of travel that rescue a too-short interval.
+            A release that snaps fully open in one frame is real; 0 (the default,
+            matching the robomimic pipeline) disables the rescue.
+        mask_whole_command_run: True (robomimic default) masks the whole command
+            run from the first conflict; False masks only the conflicting frames,
+            which is needed for continuous setpoint commands.  See
+            :func:`_filter_gripper_labels`.
+        sentinel_tail: Append a dummy trailing gripper interval (robomimic hack);
+            keep True for robomimic, False when annotations already delimit events
     
     Returns:
         Dict with 'movement' and 'gripper' timeline lists
@@ -942,14 +1139,28 @@ def segment_trajectory_v3(
     
     # Gripper timeline (V2 logic)
     gripper_intervals = segment_gripper_timeline(
-        gripper, action_gripper, gripper_threshold, max_gap
+        gripper, action_gripper, gripper_threshold, max_gap,
+        sentinel_tail=sentinel_tail,
+        mask_whole_command_run=mask_whole_command_run
     )
     
-    # Filter gripper intervals
+    # Merge two-stage closures into single intervals (real grippers squeeze twice)
+    gripper_intervals = merge_gripper_hiccups(gripper_intervals, max_hiccup=merge_hiccup_gaps)
+
+    # Merge same-direction pieces separated by a slow plateau (a physical action
+    # runs until the gripper reverses, not until it slows down)
+    if interrupted_action_gap > 0:
+        gripper_intervals = merge_interrupted_actions(
+            gripper_intervals, gripper, max_gap=interrupted_action_gap
+        )
     gripper_intervals = filter_gripper_intervals(
         gripper_intervals, movement_intervals,
-        min_movement_between=10,
-        max_close_open_gap=30
+        min_movement_between=min_movement_between,
+        max_close_open_gap=max_close_open_gap,
+        min_closing_duration=min_closing_duration,
+        min_opening_duration=min_opening_duration,
+        gripper_signal=gripper,
+        min_short_travel=min_short_travel
     )
     
     return {

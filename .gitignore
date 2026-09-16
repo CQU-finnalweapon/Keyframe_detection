@@ -14,6 +14,9 @@
 # 1. Specific  #
 ################
 
+# Generated outputs (keypose datasets, event json, timelines, eval reports, figures)
+data/
+
 #######################
 # 2. macOS.gitignore  #
 #######################
